@@ -5,10 +5,11 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler  # 수정된 부분
 from pathlib import Path
 from tqdm import tqdm
 import math
+import os
 
 from model import TransformerLM
 from dataset import prepare_dataloaders
@@ -43,8 +44,8 @@ class Trainer:
         self.train_config = train_config
         self.device = device
 
-        # Mixed precision training
-        self.scaler = GradScaler() if train_config.mixed_precision else None
+        # Mixed precision training - 수정된 부분
+        self.scaler = GradScaler('cuda') if train_config.mixed_precision else None
 
         # Metrics
         self.global_step = 0
@@ -68,64 +69,80 @@ class Trainer:
             # Create padding mask
             padding_mask = (input_ids == self.model.pad_idx)
 
-            # Forward pass with mixed precision
+            # Forward pass with mixed precision - 수정된 부분
             if self.scaler is not None:
-                with autocast():
+                with autocast('cuda'):  # device_type 인자 제거
                     logits = self.model(input_ids, attention_mask=padding_mask)
                     loss = self._compute_loss(logits, target_ids, padding_mask)
+                    # Gradient accumulation 적용
+                    loss = loss / self.train_config.gradient_accumulation_steps
             else:
                 logits = self.model(input_ids, attention_mask=padding_mask)
                 loss = self._compute_loss(logits, target_ids, padding_mask)
+                loss = loss / self.train_config.gradient_accumulation_steps
 
             # Backward pass
-            self.optimizer.zero_grad()
-
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                
+                # Gradient accumulation step마다 업데이트
+                if (batch_idx + 1) % self.train_config.gradient_accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
             else:
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                self.optimizer.step()
+                
+                if (batch_idx + 1) % self.train_config.gradient_accumulation_steps == 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
 
-            self.scheduler.step()
-
-            # Update metrics
-            losses.update(loss.item(), input_ids.size(0))
-            self.global_step += 1
-
-            # Update progress bar
+            # Update metrics (매 배치마다)
+            losses.update(loss.item() * self.train_config.gradient_accumulation_steps, input_ids.size(0))
+            
+            # 메모리 해제
+            del logits, loss, padding_mask
+            if (batch_idx + 1) % self.train_config.gradient_accumulation_steps == 0:
+                torch.cuda.empty_cache()
+            
+            # Progress bar는 매 배치마다 업데이트
             progress_bar.set_postfix({
                 'loss': f'{losses.avg:.4f}',
                 'lr': f'{get_lr(self.optimizer):.2e}',
-                'ppl': f'{math.exp(losses.avg):.2f}'
+                'ppl': f'{math.exp(min(losses.avg, 10)):.2f}'  # overflow 방지
             })
+            
+            # step은 실제 optimizer step마다만 증가
+            if (batch_idx + 1) % self.train_config.gradient_accumulation_steps == 0:
+                self.global_step += 1
 
-            # Log and evaluate
-            if self.global_step % self.config.log_interval == 0:
-                print(f"\nStep {self.global_step} - Train Loss: {losses.avg:.4f}, "
-                      f"Perplexity: {math.exp(losses.avg):.2f}")
+                # Log and evaluate (optimizer step마다)
+                if self.global_step % self.config.log_interval == 0:
+                    print(f"\nStep {self.global_step} - Train Loss: {losses.avg:.4f}, "
+                        f"Perplexity: {math.exp(min(losses.avg, 10)):.2f}")
 
-            if self.global_step % self.config.eval_interval == 0:
-                val_loss = self.validate()
-                print(f"Step {self.global_step} - Val Loss: {val_loss:.4f}, "
-                      f"Perplexity: {math.exp(val_loss):.2f}")
+                if self.global_step % self.config.eval_interval == 0:
+                    val_loss = self.validate()
+                    print(f"Step {self.global_step} - Val Loss: {val_loss:.4f}, "
+                        f"Perplexity: {math.exp(min(val_loss, 10)):.2f}")
 
-                # Check for improvement
-                if val_loss < self.best_val_loss - self.train_config.min_delta:
-                    self.best_val_loss = val_loss
-                    self.patience_counter = 0
-                    self._save_best_checkpoint(epoch, val_loss)
-                else:
-                    self.patience_counter += 1
+                    # Check for improvement
+                    if val_loss < self.best_val_loss - self.train_config.min_delta:
+                        self.best_val_loss = val_loss
+                        self.patience_counter = 0
+                        self._save_best_checkpoint(epoch, val_loss)
+                    else:
+                        self.patience_counter += 1
 
-                self.model.train()
+                    self.model.train()
 
-            if self.global_step % self.config.save_interval == 0:
-                self._save_checkpoint(epoch, losses.avg)
+                if self.global_step % self.config.save_interval == 0:
+                    self._save_checkpoint(epoch, losses.avg)
 
         return losses.avg
 
@@ -145,29 +162,34 @@ class Trainer:
             loss = self._compute_loss(logits, target_ids, padding_mask)
 
             losses.update(loss.item(), input_ids.size(0))
+            
+            # 메모리 해제
+            del input_ids, target_ids, logits, loss, padding_mask
 
+        torch.cuda.empty_cache()
         return losses.avg
 
     def _compute_loss(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        padding_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute cross-entropy loss ignoring padding tokens"""
-        # Flatten for loss computation
-        logits_flat = logits.view(-1, logits.size(-1))
-        targets_flat = targets.view(-1)
+            self,
+            logits: torch.Tensor,
+            targets: torch.Tensor,
+            padding_mask: torch.Tensor
+        ) -> torch.Tensor:
+            """Compute cross-entropy loss ignoring padding tokens"""
+            # Flatten for loss computation
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
 
-        # Compute loss
-        loss = nn.functional.cross_entropy(
-            logits_flat,
-            targets_flat,
-            ignore_index=self.model.pad_idx,
-            reduction='mean'
-        )
+            # Compute loss with label smoothing
+            loss = nn.functional.cross_entropy(
+                logits_flat,
+                targets_flat,
+                ignore_index=self.model.pad_idx,
+                label_smoothing=0.1,
+                reduction='mean'
+            )
 
-        return loss
+            return loss
 
     def _save_checkpoint(self, epoch: int, loss: float):
         """Save regular checkpoint"""
@@ -206,8 +228,28 @@ class Trainer:
         print(f"Best validation loss: {self.best_val_loss:.4f}")
 
 
+import math
+from torch.optim.lr_scheduler import LambdaLR
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.01):
+    """Cosine schedule with warmup"""
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            # Warmup: 0에서 1까지 선형 증가
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Cosine decay: 1에서 min_lr_ratio까지 감소
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def main():
     """Main training function"""
+
+    # Tokenizers parallelism 경고 제거
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     # Configuration
     config = ModelConfig()
     train_config = TrainingConfig()
@@ -248,7 +290,7 @@ def main():
         batch_size=config.batch_size,
         max_seq_len=config.max_seq_len,
         num_workers=train_config.num_workers,
-        pin_memory=train_config.pin_memory
+        pin_memory=False  # pin_memory False로 변경
     )
 
     # Create model
@@ -273,15 +315,16 @@ def main():
         lr=config.learning_rate,
         betas=(0.9, 0.98),
         eps=1e-9,
-        weight_decay=0.01
+        weight_decay=config.weight_decay
     )
 
-    # Learning rate scheduler
-    total_steps = len(train_loader) * config.num_epochs
-    scheduler = CosineAnnealingLR(
+    # Learning rate scheduler with warmup
+    total_steps = len(train_loader) * config.num_epochs // train_config.gradient_accumulation_steps
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        T_max=total_steps,
-        eta_min=train_config.min_lr
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=total_steps,
+        min_lr_ratio=train_config.min_lr / config.learning_rate
     )
 
     # Trainer
@@ -298,7 +341,6 @@ def main():
 
     # Train
     trainer.train()
-
 
 if __name__ == "__main__":
     main()
