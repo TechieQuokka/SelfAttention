@@ -7,22 +7,22 @@ from typing import Optional
 @dataclass
 class ModelConfig:
     """Transformer 모델 설정"""
-    # Model architecture
+    # Model architecture - Phase 1 개선
     vocab_size: int = 30000
-    d_model: int = 256  # Embedding dimension
-    n_heads: int = 4  # Number of attention heads
-    n_layers: int = 3  # Number of transformer layers
-    d_ff: int = 768  # Feed-forward dimension
-    dropout: float = 0.35  # 0.4 → 0.35 (약간 완화)
+    d_model: int = 512  # 256 → 512 (2배 증가)
+    n_heads: int = 8    # 4 → 8 (2배 증가)
+    n_layers: int = 6   # 3 → 6 (2배 증가)
+    d_ff: int = 2048    # 768 → 2048 (2.7배 증가)
+    dropout: float = 0.1  # 0.35 → 0.1 (정규화 완화)
     max_seq_len: int = 512  # Maximum sequence length
 
-    # Training
-    batch_size: int = 16
-    learning_rate: float = 4e-5  # 3e-5 → 4e-5 (조금 높임)
+    # Training - Phase 1 개선
+    batch_size: int = 16  # GPU 메모리에 따라 조정 가능
+    learning_rate: float = 2e-4  # 4e-5 → 2e-4 (5배 증가)
     num_epochs: int = 50
-    warmup_steps: int = 3000  # 2000 → 3000 (좀 더 안정적으로)
-    gradient_clip: float = 0.5  # 1.0 → 0.5 (gradient 더 제한)
-    weight_decay: float = 0.08  # 0.1 → 0.08 (약간 완화)
+    warmup_steps: int = 4000  # 3000 → 4000 (모델 커져서 증가)
+    gradient_clip: float = 1.0  # 0.5 → 1.0 (완화)
+    weight_decay: float = 0.01  # 0.08 → 0.01 (정규화 완화)
 
     # Data
     data_path: str = "data/wikitext2"
@@ -50,6 +50,9 @@ class TrainingConfig:
     pin_memory: bool = True
     mixed_precision: bool = True  # Use automatic mixed precision
     gradient_accumulation_steps: int = 4
+
+    # Regularization
+    label_smoothing: float = 0.1  # Applied during training only (not validation/test)
 
     # Early stopping
     patience: int = 5

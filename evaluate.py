@@ -42,7 +42,7 @@ def evaluate_model(model: TransformerLM, test_loader, device: str = "cuda"):
         # Forward pass
         logits = model(input_ids, attention_mask=padding_mask)
 
-        # Compute loss
+        # Compute loss (no label smoothing for evaluation)
         logits_flat = logits.view(-1, logits.size(-1))
         targets_flat = target_ids.view(-1)
 
@@ -50,6 +50,7 @@ def evaluate_model(model: TransformerLM, test_loader, device: str = "cuda"):
             logits_flat,
             targets_flat,
             ignore_index=model.pad_idx,
+            label_smoothing=0.0,  # No label smoothing for fair evaluation
             reduction='mean'
         )
 

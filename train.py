@@ -73,12 +73,12 @@ class Trainer:
             if self.scaler is not None:
                 with autocast('cuda'):  # device_type 인자 제거
                     logits = self.model(input_ids, attention_mask=padding_mask)
-                    loss = self._compute_loss(logits, target_ids, padding_mask)
+                    loss = self._compute_loss(logits, target_ids, padding_mask, training=True)
                     # Gradient accumulation 적용
                     loss = loss / self.train_config.gradient_accumulation_steps
             else:
                 logits = self.model(input_ids, attention_mask=padding_mask)
-                loss = self._compute_loss(logits, target_ids, padding_mask)
+                loss = self._compute_loss(logits, target_ids, padding_mask, training=True)
                 loss = loss / self.train_config.gradient_accumulation_steps
 
             # Backward pass
@@ -159,7 +159,8 @@ class Trainer:
             padding_mask = (input_ids == self.model.pad_idx)
 
             logits = self.model(input_ids, attention_mask=padding_mask)
-            loss = self._compute_loss(logits, target_ids, padding_mask)
+            # Validation uses training=False (no label smoothing) for fair evaluation
+            loss = self._compute_loss(logits, target_ids, padding_mask, training=False)
 
             losses.update(loss.item(), input_ids.size(0))
             
@@ -173,19 +174,31 @@ class Trainer:
             self,
             logits: torch.Tensor,
             targets: torch.Tensor,
-            padding_mask: torch.Tensor
+            padding_mask: torch.Tensor,
+            training: bool = False
         ) -> torch.Tensor:
-            """Compute cross-entropy loss ignoring padding tokens"""
+            """
+            Compute cross-entropy loss ignoring padding tokens
+
+            Args:
+                logits: Model output logits
+                targets: Target token IDs
+                padding_mask: Mask for padding tokens
+                training: If True, apply label smoothing (for training only)
+            """
             # Flatten for loss computation
             logits_flat = logits.view(-1, logits.size(-1))
             targets_flat = targets.view(-1)
 
-            # Compute loss with label smoothing
+            # Apply label smoothing only during training
+            # Validation/test should use standard cross-entropy for fair comparison
+            label_smoothing = self.train_config.label_smoothing if training else 0.0
+
             loss = nn.functional.cross_entropy(
                 logits_flat,
                 targets_flat,
                 ignore_index=self.model.pad_idx,
-                label_smoothing=0.1,
+                label_smoothing=label_smoothing,
                 reduction='mean'
             )
 
