@@ -1,5 +1,6 @@
 """
-Transformer Language Model Implementation
+Transformer Language Model Implementation - Enhanced Version
+Optimized for WikiText-2 dataset
 """
 import torch
 import torch.nn as nn
@@ -7,8 +8,9 @@ import torch.nn.functional as F
 import math
 from typing import Optional
 
+
 class MultiHeadAttention(nn.Module):
-    """Multi-Head Self-Attention mechanism"""
+    """Enhanced Multi-Head Self-Attention with residual dropout"""
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -19,14 +21,17 @@ class MultiHeadAttention(nn.Module):
         self.d_k = d_model // n_heads
 
         # Linear projections for Q, K, V
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
 
         # Output projection
-        self.W_o = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
 
-        self.dropout = nn.Dropout(dropout)
+        # Separate dropouts for attention weights and output
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        
         self.scale = math.sqrt(self.d_k)
 
     def forward(
@@ -45,14 +50,11 @@ class MultiHeadAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
 
         # Linear projections and reshape for multi-head attention
-        # (batch_size, seq_len, d_model) -> (batch_size, n_heads, seq_len, d_k)
         Q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         K = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         V = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
 
         # Scaled dot-product attention
-        # (batch_size, n_heads, seq_len, d_k) @ (batch_size, n_heads, d_k, seq_len)
-        # -> (batch_size, n_heads, seq_len, seq_len)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
         # Apply mask if provided
@@ -61,23 +63,21 @@ class MultiHeadAttention(nn.Module):
 
         # Attention weights
         attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        attn_weights = self.attn_dropout(attn_weights)
 
         # Apply attention to values
-        # (batch_size, n_heads, seq_len, seq_len) @ (batch_size, n_heads, seq_len, d_k)
-        # -> (batch_size, n_heads, seq_len, d_k)
         attn_output = torch.matmul(attn_weights, V)
 
         # Concatenate heads and apply output projection
-        # (batch_size, n_heads, seq_len, d_k) -> (batch_size, seq_len, d_model)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.W_o(attn_output)
+        output = self.resid_dropout(output)  # Residual dropout 추가
 
         return output
 
 
 class FeedForward(nn.Module):
-    """Position-wise Feed-Forward Network"""
+    """Position-wise Feed-Forward Network with GELU activation"""
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
@@ -97,9 +97,17 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Single Transformer decoder block"""
+    """Enhanced Transformer decoder block with residual scaling"""
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+    def __init__(
+        self, 
+        d_model: int, 
+        n_heads: int, 
+        d_ff: int, 
+        dropout: float = 0.1,
+        layer_id: int = 0,
+        num_layers: int = 6
+    ):
         super().__init__()
 
         # Multi-head self-attention
@@ -115,6 +123,9 @@ class TransformerBlock(nn.Module):
         # Dropout
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
+        
+        # Residual scaling for deep networks
+        self.scale = 1.0 / math.sqrt(2 * num_layers)
 
     def forward(
         self,
@@ -129,13 +140,13 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tensor (batch_size, seq_len, d_model)
         """
-        # Self-attention with residual connection and layer norm
+        # Self-attention with residual connection, layer norm, and scaling
         attn_output = self.attention(self.ln1(x), mask)
-        x = x + self.dropout1(attn_output)
+        x = x + self.scale * self.dropout1(attn_output)
 
-        # Feed-forward with residual connection and layer norm
+        # Feed-forward with residual connection, layer norm, and scaling
         ff_output = self.feed_forward(self.ln2(x))
-        x = x + self.dropout2(ff_output)
+        x = x + self.scale * self.dropout2(ff_output)
 
         return x
 
@@ -171,7 +182,7 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerLM(nn.Module):
-    """Transformer Language Model"""
+    """Enhanced Transformer Language Model with weight tying and residual scaling"""
 
     def __init__(
         self,
@@ -182,12 +193,14 @@ class TransformerLM(nn.Module):
         d_ff: int = 2048,
         max_seq_len: int = 512,
         dropout: float = 0.1,
-        pad_idx: int = 0
+        pad_idx: int = 0,
+        tie_weights: bool = True
     ):
         super().__init__()
 
         self.d_model = d_model
         self.pad_idx = pad_idx
+        self.n_layers = n_layers
 
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
@@ -195,30 +208,37 @@ class TransformerLM(nn.Module):
         # Positional encoding
         self.positional_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
 
-        # Transformer blocks
+        # Transformer blocks with layer indexing for residual scaling
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
+            TransformerBlock(d_model, n_heads, d_ff, dropout, layer_id=i, num_layers=n_layers)
+            for i in range(n_layers)
         ])
 
         # Final layer normalization
         self.ln_f = nn.LayerNorm(d_model)
 
         # Output projection to vocabulary
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Weight tying: share weights between embedding and output layer
+        if tie_weights:
+            self.lm_head.weight = self.token_embedding.weight
 
         # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights"""
+        """Initialize weights with proper scaling"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
+                # Xavier/Glorot initialization with scaled std
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
 
     def _create_causal_mask(self, seq_len: int, device: str) -> torch.Tensor:
         """Create causal mask for autoregressive generation"""

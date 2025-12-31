@@ -15,6 +15,7 @@ class ModelConfig:
     d_ff: int = 2048    # 768 → 2048 (2.7배 증가)
     dropout: float = 0.1  # 0.35 → 0.1 (정규화 완화)
     max_seq_len: int = 512  # Maximum sequence length
+    tie_weights: bool = True
 
     # Training - Phase 1 개선
     batch_size: int = 16  # GPU 메모리에 따라 조정 가능

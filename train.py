@@ -316,7 +316,8 @@ def main():
         d_ff=config.d_ff,
         max_seq_len=config.max_seq_len,
         dropout=config.dropout,
-        pad_idx=tokenizer.pad_token_id
+        pad_idx=tokenizer.pad_token_id,
+        tie_weights=config.tie_weights
     ).to(device)
 
     num_params = count_parameters(model)
